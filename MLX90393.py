@@ -43,17 +43,13 @@ class BusPirate(object):
     self.ser.write(b'\x8d')
     resp = self.ser.read(1)
     if ord(resp) != 1 :
-      print 'ConfigSPI error'
-      print resp
-      sys.exit()
+      raise ValueError('ConfigSPI error', resp)
 
   def ConfigPeripherals(self):
     self.ser.write(b'\x49')
     resp = self.ser.read(1)
     if ord(resp) != 1 :
-      print 'ConfigPeripherals error'
-      print resp
-      sys.exit()
+      raise ValueError('ConfigPeripherals error', resp)
 
   def Connect(self):
     self.ser = serial.Serial(self.port,
@@ -74,9 +70,7 @@ class BusPirate(object):
     self.ser.write(b'\x01')
     resp = self.ser.read(5)
     if resp != 'SPI1':
-      print "can't enter binary SPI mode\n"
-      print resp
-      sys.exit()
+      raise ValueError("can't enter binary SPI mode", resp)
 
     self.ConfigSPI()
     self.ConfigPeripherals()
@@ -95,16 +89,16 @@ class BusPirate(object):
     self.ser.write(data)
     resp = self.ser.read(l + 1)
     self.DeAssertCS()
-    #print 'resp = ', [hex(ord(c)) for c in resp]
     if resp[0] != b'\x01':
-      print "Invalid response '", resp[0], "' received in BulkTransfer"
-      sys.exit()
+      raise ValueError('Invalid response ' + 
+                       resp[0] + ' received in BulkTransfer')
     return resp[1:]
 
 
 
 class MLX90393(object):
-  __slots__ = ('BP', '_GAIN_SEL', '_RES_X', '_RES_Y', '_RES_Z', 
+  __slots__ = ('BP', '_cache_dirty', '_cache_items',
+               '_GAIN_SEL', '_RES_X', '_RES_Y', '_RES_Z', 
                '_OSR', '_DIG_FLT', '_TCMP_EN',
                '_SensitivityXY', '_SensitivityZ', '_Tconv', '_StatusBits',
                '_GAIN_SEL_REG', '_GAIN_SEL_MASK', '_GAIN_SEL_SHIFT',
@@ -152,6 +146,13 @@ class MLX90393(object):
     self._TCMP_EN_REG = 0x1
     self._TCMP_EN_MASK = 0x0400
     self._TCMP_EN_SHIFT = 10
+
+    self._cache_items = ['GAIN_SEL', 'RES_X', 'RES_Y', 'RES_Z',
+                         'OSR', 'DIG_FLT', 'TCMP_EN'];
+
+    self._cache_dirty = {}
+    for item in self._cache_items:
+      self._cache_dirty[item] = True
 
     self._StatusBits = { 'BURST_MODE' : 0x80,
                          'WOC_MDE'    : 0x40,
@@ -203,16 +204,14 @@ class MLX90393(object):
 
   def _CheckStatus(self, status):
     if status & self._StatusBits['ERROR']:
-      print 'Error bit reported by MLX90393'
       self._DumpStatus(status)
-      sys.exit()
+      raise ValueError('Error bit reported by MLX90393')
 
-  def ReadRawXYZ(self, conv):
-    flags = 0x0e
-    count = 3
-    resp = self.BP.BulkTransfer(chr(0x30 | flags) + b'\x00')
+  def ReadRaw(self, count, flags, conv):
     # wait for conversion time (25% margin added)
-    time.sleep(1.25 * self._Tconv[self._DIG_FLT][self._OSR] * count / 1000.)
+    delay_time = 1.25 * self._Tconv[self.DIG_FLT][self.OSR] * count / 1000. 
+    resp = self.BP.BulkTransfer(chr(0x30 | flags) + b'\x00')
+    time.sleep(delay_time)
     resp = self.BP.BulkTransfer(chr(0x40 | flags) +
                                 b'\x00' + b'\x00\x00' * count)
     data = struct.unpack('>xB' + conv, resp)
@@ -221,65 +220,103 @@ class MLX90393(object):
     raw = data[1:]
     return raw
 
-  def ReadTemperature(self):
+  def ReadRawXYZ(self, conv):
+    return self.ReadRaw(count = 3, flags = 0x0e, conv = conv)
+
+  def ReadRawT(self):
+    return self.ReadRaw(count = 1, flags = 0x01, conv = 'H')[0]
+
+  def ReadRawXYZT(self, conv):
+    return self.ReadRaw(count = 4, flags = 0x0f, conv = 'H' + conv)
+
+  def ScaleT(self, raw_t):
+    return 25 + ((raw_t - 46244) / 45.2)
+
+  def ScaleXYZ(self, raw_xyz):
+    if self.RES_X == 2:
+      x = ((raw_xyz[0] - float(2**15)) *
+           self._SensitivityXY[self.GAIN_SEL][self.RES_X])
+    else:
+      if self.RES_X == 3:
+        x = ((raw_xyz[0] - float(2**14)) *
+             self._SensitivityXY[self.GAIN_SEL][self.RES_X])
+      else:
+        x = raw_xyz[0] * self._SensitivityXY[self.GAIN_SEL][self.RES_X]
+
+    if self.RES_Y == 2:
+      y = ((raw_xyz[1] - float(2**15)) *
+           self._SensitivityXY[self.GAIN_SEL][self.RES_Y])
+    else:
+      if self.RES_Y == 3:
+        y = ((raw_xyz[1] - float(2**14)) *
+             self._SensitivityXY[self.GAIN_SEL][self.RES_Y])
+      else:
+        y = raw_xyz[1] * self._SensitivityXY[self.GAIN_SEL][self.RES_Y]
+
+    if self.RES_Z == 2:
+      z = ((raw_xyz[2] - float(2**15)) *
+           self._SensitivityZ[self.GAIN_SEL][self.RES_Z])
+    else:
+      if self.RES_Z == 3:
+        z = ((raw_xyz[2] - float(2**14)) *
+             self._SensitivityZ[self.GAIN_SEL][self.RES_Z])
+      else:
+        z = raw_xyz[2] * self._SensitivityZ[self.GAIN_SEL][self.RES_Z]
+
+    return (x, y, z)
+
+  def ReadT(self):
     self._CheckSettings()
-    raw = self.ReadRaw('t')
-    return 25 + ((raw[0]-46244) / 45.2)
+    raw_t = self.ReadRawT()
+    return self.ScaleT(raw_t)
 
   def ReadXYZ(self):
     self._CheckSettings()
 
-    if self._TCMP_EN:
-      print "TCMP_EN = 1 not yet supported"
-      sys.exit()
+    if self.TCMP_EN:
+      raise ValueError("TCMP_EN = 1 not yet supported")
 
-    if self._RES_X in [2, 3]:
+    if self.RES_X in [2, 3]:
       conv = 'H'
     else:
       conv = 'h'
-    if self._RES_Y in [2, 3]:
+    if self.RES_Y in [2, 3]:
       conv += 'H'
     else:
       conv += 'h'
-    if self._RES_Z in [2, 3]:
+    if self.RES_Z in [2, 3]:
       conv += 'H'
     else:
       conv += 'h'
 
-    raw = self.ReadRawXYZ(conv)
+    raw_xyz = self.ReadRawXYZ(conv)
+    return self.ScaleXYZ(raw_xyz)
 
-    if self._RES_X == 2:
-      x = ((raw[0] - float(2**15)) *
-           self._SensitivityXY[self._GAIN_SEL][self._RES_X])
+  def ReadXYZT(self):
+    self._CheckSettings()
+
+    if self.TCMP_EN:
+      raise ValueError("TCMP_EN = 1 not yet supported")
+
+    if self.RES_X in [2, 3]:
+      conv = 'H'
     else:
-      if self._RES_X == 3:
-        x = ((raw[0] - float(2**14)) *
-             self._SensitivityXY[self._GAIN_SEL][self._RES_X])
-      else:
-        x = raw[0] * self._SensitivityXY[self._GAIN_SEL][self._RES_X]
-
-    if self._RES_Y == 2:
-      y = ((raw[1] - float(2**15)) *
-           self._SensitivityXY[self._GAIN_SEL][self._RES_Y])
+      conv = 'h'
+    if self.RES_Y in [2, 3]:
+      conv += 'H'
     else:
-      if self._RES_Y == 3:
-        y = ((raw[1] - float(2**14)) *
-             self._SensitivityXY[self._GAIN_SEL][self._RES_Y])
-      else:
-        y = raw[1] * self._SensitivityXY[self._GAIN_SEL][self._RES_Y]
-
-    if self._RES_Z == 2:
-      z = ((raw[2] - float(2**15)) *
-           self._SensitivityZ[self._GAIN_SEL][self._RES_Z])
+      conv += 'h'
+    if self.RES_Z in [2, 3]:
+      conv += 'H'
     else:
-      if self._RES_Z == 3:
-        z = ((raw[2] - float(2**14)) *
-             self._SensitivityZ[self._GAIN_SEL][self._RES_Z])
-      else:
-        z = raw[2] * self._SensitivityZ[self._GAIN_SEL][self._RES_Z]
+      conv += 'h'
 
+    raw_xyzt = self.ReadRawXYZT(conv)
 
-    return (x, y, z)
+    return (self.ScaleXYZ(raw_xyzt[1:4])[0],
+            self.ScaleXYZ(raw_xyzt[1:4])[1],
+            self.ScaleXYZ(raw_xyzt[1:4])[2],
+            self.ScaleT(raw_xyzt[0]))
 
   def ReadRegister(self, address):
     cmd = b'\x50' + chr((address & 0x3f) << 2) + b'\x00\x00\x00'
@@ -290,6 +327,9 @@ class MLX90393(object):
     return unpacked[1]
 
   def WriteRegister(self, address, data):
+    for item in self._cache_items:
+      self._cache_dirty[item] = True
+
     cmd = b'\x60' + ( chr((data & 0xff00) >> 8) +
                       chr(data & 0xff) +
                       chr((address & 0x3f) << 2) + b'\x00' )
@@ -301,25 +341,26 @@ class MLX90393(object):
     resp = self.BP.BulkTransfer(b'\xf0\x00')
     status = struct.unpack('>xB', resp)[0]
     if (status & 0xfc) != 4:
-      print "Reset returned bad status :", hex(status)
-      sys.exit()
+      raise ValueError('Reset returned bad status :' + hex(status))
 
   # check for settings combinations forbidden by datasheet
   def _CheckSettings(self):
-    if self._OSR == 0 and self._DIG_FLT == 0:
-      print "setting self._OSR == 0 and self._DIG_FLT == 0 forbidden"
-      sys.exit()
-    if self._OSR == 0 and self._DIG_FLT == 1:
-      print "setting self._OSR == 0 and self._DIG_FLT == 1 forbidden"
-      sys.exit()
-    if self._OSR == 1 and self._DIG_FLT == 1:
-      print "setting self._OSR == 1 and self._DIG_FLT == 1 forbidden"
-      sys.exit()
+    if self.OSR == 0 and self.DIG_FLT == 0:
+      raise ValueError('setting self._OSR == 0 and ' +
+                       'self._DIG_FLT == 0 forbidden')
+    if self.OSR == 0 and self.DIG_FLT == 1:
+      raise ValueError('setting self._OSR == 0 and ' +
+                       'self._DIG_FLT == 1 forbidden')
+    if self.OSR == 1 and self.DIG_FLT == 1:
+      raise ValueError('setting self._OSR == 1 and ' +
+                       'self._DIG_FLT == 1 forbidden')
 
   @property
   def GAIN_SEL(self):
-    self._GAIN_SEL = (self.ReadRegister(self._GAIN_SEL_REG) &
-                      self._GAIN_SEL_MASK) >> self._GAIN_SEL_SHIFT
+    if self._cache_dirty['GAIN_SEL']:
+      self._cache_dirty['GAIN_SEL'] = False
+      self._GAIN_SEL = (self.ReadRegister(self._GAIN_SEL_REG) &
+                        self._GAIN_SEL_MASK) >> self._GAIN_SEL_SHIFT
     return self._GAIN_SEL
 
   @GAIN_SEL.setter
@@ -332,8 +373,10 @@ class MLX90393(object):
 
   @property
   def RES_X(self):
-    self._RES_X = (self.ReadRegister(self._RES_X_REG) &
-                   self._RES_X_MASK) >> self._RES_X_SHIFT
+    if self._cache_dirty['RES_X']:
+      self._cache_dirty['RES_X'] = False
+      self._RES_X = (self.ReadRegister(self._RES_X_REG) &
+                     self._RES_X_MASK) >> self._RES_X_SHIFT
     return self._RES_X
 
   @RES_X.setter
@@ -346,8 +389,10 @@ class MLX90393(object):
 
   @property
   def RES_Y(self):
-    self._RES_Y = (self.ReadRegister(self._RES_Y_REG) &
-                   self._RES_Y_MASK) >> self._RES_Y_SHIFT
+    if self._cache_dirty['RES_Y']:
+      self._cache_dirty['RES_Y'] = False
+      self._RES_Y = (self.ReadRegister(self._RES_Y_REG) &
+                     self._RES_Y_MASK) >> self._RES_Y_SHIFT
     return self._RES_Y
 
   @RES_Y.setter
@@ -360,8 +405,10 @@ class MLX90393(object):
 
   @property
   def RES_Z(self):
-    self._RES_Z = (self.ReadRegister(self._RES_Z_REG) &
-                   self._RES_Z_MASK) >> self._RES_Z_SHIFT
+    if self._cache_dirty['RES_Z']:
+      self._cache_dirty['RES_Z'] = False
+      self._RES_Z = (self.ReadRegister(self._RES_Z_REG) &
+                     self._RES_Z_MASK) >> self._RES_Z_SHIFT
     return self._RES_Z
 
   @RES_Z.setter
@@ -372,10 +419,13 @@ class MLX90393(object):
            ((int(value) << self._RES_Z_SHIFT) & self._RES_Z_MASK))
     self.WriteRegister(self._RES_Z_REG, reg)
 
+
   @property
   def OSR(self):
-    self._OSR = (self.ReadRegister(self._OSR_REG) &
-                      self._OSR_MASK) >> self._OSR_SHIFT
+    if self._cache_dirty['OSR']:
+      self._cache_dirty['OSR'] = False
+      self._OSR = (self.ReadRegister(self._OSR_REG) &
+                   self._OSR_MASK) >> self._OSR_SHIFT
     return self._OSR
 
   @OSR.setter
@@ -388,8 +438,10 @@ class MLX90393(object):
 
   @property
   def DIG_FLT(self):
-    self._DIG_FLT = (self.ReadRegister(self._DIG_FLT_REG) &
-                     self._DIG_FLT_MASK) >> self._DIG_FLT_SHIFT
+    if self._cache_dirty['DIG_FLT']:
+      self._cache_dirty['DIG_FLT'] = False
+      self._DIG_FLT = (self.ReadRegister(self._DIG_FLT_REG) &
+                       self._DIG_FLT_MASK) >> self._DIG_FLT_SHIFT
     return self._DIG_FLT
 
   @DIG_FLT.setter
@@ -402,8 +454,10 @@ class MLX90393(object):
 
   @property
   def TCMP_EN(self):
-    self._TCMP_EN = (self.ReadRegister(self._TCMP_EN_REG) &
-                     self._TCMP_EN_MASK) >> self._TCMP_EN_SHIFT
+    if self._cache_dirty['TCMP_EN']:
+      self._cache_dirty['TCMP_EN'] = False
+      self._TCMP_EN = (self.ReadRegister(self._TCMP_EN_REG) &
+                       self._TCMP_EN_MASK) >> self._TCMP_EN_SHIFT
     return self._TCMP_EN
 
   @TCMP_EN.setter
