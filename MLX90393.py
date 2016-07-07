@@ -273,8 +273,8 @@ class MLX90393(object):
   def ReadXYZ(self):
     self._CheckSettings()
 
-    if self.TCMP_EN:
-      raise ValueError("TCMP_EN = 1 not yet supported")
+#    if self.TCMP_EN:
+#      raise ValueError("TCMP_EN = 1 not yet supported")
 
     if self.RES_X in [2, 3]:
       conv = 'H'
@@ -295,8 +295,8 @@ class MLX90393(object):
   def ReadXYZT(self):
     self._CheckSettings()
 
-    if self.TCMP_EN:
-      raise ValueError("TCMP_EN = 1 not yet supported")
+#    if self.TCMP_EN:
+#      raise ValueError("TCMP_EN = 1 not yet supported")
 
     if self.RES_X in [2, 3]:
       conv = 'H'
@@ -335,6 +335,13 @@ class MLX90393(object):
                       chr((address & 0x3f) << 2) + b'\x00' )
     resp = self.BP.BulkTransfer(cmd)
     status = struct.unpack('>xxxxB', resp)[0]
+    self._CheckStatus(status)
+
+  def MemoryRecall(self):
+    cmd = b'\xD0' + b'\x00'
+    resp = self.BP.BulkTransfer(cmd)
+    unpacked = struct.unpack('>xB', resp)
+    status = unpacked[0]
     self._CheckStatus(status)
 
   def Reset(self):
@@ -471,7 +478,7 @@ class MLX90393(object):
 def main():
   BP = BusPirate(port = '/dev/ttyUSB1',
                  baud = 115200,
-                 timeout = 0.01);
+                 timeout = 0.1);
   BP.Connect()
   MLX = MLX90393(BP)
   MLX.Reset()
